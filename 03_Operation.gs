@@ -1,66 +1,117 @@
 /**
  * [모듈 03] 03_Operation.gs
  * 프로젝트: 2026 Smart Field ERP (AI 비서 통합형)
- * 역할: 현장일지 기록(자재 차감), 일정 등록(캘린더), 상황판 브리핑, 안전 확인
- * 최종 업데이트: 2026-02-16
- * 수정자: Gemini (강성묵 과장 시스템 설계 최종 합의안 반영 - 달력 UI 규격 보정)
+ * 역할: 현장일지 기록(레시피 기반 자재 차감), 일정 등록, 상황판 브리핑
+ * 최종 업데이트: 2026-02-24 (운영설정 과수소요량 자동 차감 및 자연어기록 연동 반영)
  */
 
 /**
  * 📝 1. 현장일지 기록 및 자재 재고 자동 차감
+ * 과장님 지침: 운영설정의 레시피(BOM)를 읽어와 여러 자재를 한 번에 차감함
  */
 function recordFieldJournal(chatId, journalData) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const journalSheet = ss.getSheetByName(CONFIG.SHEETS.FIELD_LOG) || ss.getSheetByName("현장일지");
   if (!journalSheet) return Telegram.sendMessage(chatId, "⚠️ 현장일지 시트를 찾을 수 없습니다.");
 
+  // 1. 현장일지 데이터 기록 (A열~O열 매핑)
   journalSheet.appendRow([
     journalData.date || new Date(),           // A: 작업일자
     journalData.siteName,                     // B: 현장명
     journalData.process,                      // C: 작업공정
     journalData.workerCount,                  // D: 투입인원
     journalData.description,                  // E: 작업내용
-    journalData.matName1,                     // F: 자재명 1
-    journalData.matQty1,                      // G: 소요량 1
-    journalData.matUnit1,                     // H: 단위 1
-    journalData.matName2,                     // I: 자재명 2
-    journalData.matQty2,                      // J: 소요량 2
-    journalData.matUnit2,                     // K: 단위 2
+    journalData.matName1 || journalData.recipeName, // F: 자재명(또는 레시피명)
+    journalData.matQty1 || journalData.outputQty,  // G: 소요량(또는 완성품 수량)
+    journalData.matUnit1 || "EA",             // H: 단위
+    "", "", "",                               // I, J, K: 확장용
     journalData.photoUrl || "",               // L: 현장사진
     journalData.note || "",                   // M: 특이사항
     String(chatId),                           // N: 관리자ID
     new Date()                                // O: 최종업데이트
   ]);
 
-  // 🚀 자재 자동 차감 실행
-  if (journalData.matName1 && journalData.matQty1 > 0) {
-    updateMaterialStock(journalData.matName1, journalData.matQty1);
-  }
-  if (journalData.matName2 && journalData.matQty2 > 0) {
-    updateMaterialStock(journalData.matName2, journalData.matQty2);
+  // 2. [지능형 자재 차감] 운영설정의 과수소요량(레시피) 연동 실행
+  let deductionLog = "";
+  if (journalData.recipeName && journalData.outputQty > 0) {
+    // 레시피 기반 다중 차감 (박스, 난좌 등 한꺼번에 차감)
+    deductionLog = executeRecipeDeduction(journalData.recipeName, journalData.outputQty);
+  } else if (journalData.matName1 && journalData.matQty1 > 0) {
+    // 단일 자재 수동 입력 차감
+    const success = updateMaterialStock(journalData.matName1, journalData.matQty1);
+    deductionLog = success ? `📦 ${journalData.matName1} ${journalData.matQty1}개 차감 완료` : "⚠️ 자재 매칭 실패";
   }
 
-  return Telegram.sendMessage(chatId, "✅ 현장일지가 기록되었으며, 자재 재고가 자동으로 차감되었습니다.");
+  // 3. [자연어기록] 탭에 작업 흔적 남기기 (AI 학습용)
+  logToNaturalLanguage(chatId, "현장일지", `${journalData.siteName}: ${journalData.process} (${deductionLog})`);
+
+  return Telegram.sendMessage(chatId, `✅ <b>현장일지 기록 완료</b>\n━━━━━━━━━━━━━━━\n📍 현장: ${journalData.siteName}\n🔧 작업: ${journalData.process}\n${deductionLog ? "📉 재고: " + deductionLog : ""}`, { parse_mode: "HTML" });
+}
+
+/**
+ * 🛠️ 레시피 기반 다중 자재 차감 로직
+ * 운영설정 시트의 '과수소요량' 값을 파싱함 (예: "박스:1,난좌:2,패드:1")
+ */
+function executeRecipeDeduction(recipeName, outputQty) {
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SS_ID);
+    const opSheet = ss.getSheetByName(CONFIG.SHEETS.OP_CONFIG);
+    if (!opSheet) return "⚠️ 운영설정 시트 없음";
+
+    const data = opSheet.getDataRange().getValues();
+    let recipeStr = "";
+    
+    // 1. 해당 품목의 레시피(BOM) 문자열 찾기
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][1]).trim() === recipeName && String(data[i][0]).includes("과수소요량")) {
+        recipeStr = String(data[i][2]).trim();
+        break;
+      }
+    }
+
+    if (!recipeStr) return "레시피 정보 없음";
+
+    // 2. 문자열 파싱 및 자재관리 탭 차감 실행 (박스:1,난좌:2 -> outputQty 만큼 곱함)
+    let results = [];
+    const items = recipeStr.split(",");
+    items.forEach(item => {
+      const parts = item.split(":");
+      if (parts.length === 2) {
+        const matName = parts[0].trim();
+        const perQty = Number(parts[1].trim());
+        const totalNeed = perQty * outputQty;
+        
+        if (updateMaterialStock(matName, totalNeed)) {
+          results.push(`${matName}-${totalNeed}`);
+        }
+      }
+    });
+
+    return results.length > 0 ? results.join(", ") : "차감 대상 없음";
+  } catch (e) { return "레시피 오류"; }
 }
 
 /**
  * 📦 자재고 차감 처리 유틸리티
  */
 function updateMaterialStock(matName, useQty) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = SpreadsheetApp.openById(CONFIG.SS_ID);
   const matSheet = ss.getSheetByName(CONFIG.SHEETS.MATERIALS);
-  if (!matSheet) return;
+  if (!matSheet) return false;
 
   const data = matSheet.getDataRange().getValues();
   for (let i = 1; i < data.length; i++) {
-    if (String(data[i][CONFIG.COL.MAT_NAME]).trim() === String(matName).trim()) {
-      const currentQty = Number(data[i][CONFIG.COL.MAT_QTY]) || 0;
+    // 자재관리 시트의 A열(항목명) 매칭
+    if (String(data[i][0]).trim() === String(matName).trim()) {
+      const currentQty = Number(data[i][2]) || 0; // C열: 현재고
       const newQty = currentQty - useQty;
-      matSheet.getRange(i + 1, CONFIG.COL.MAT_QTY + 1).setValue(newQty);
-      matSheet.getRange(i + 1, CONFIG.COL.MAT_DATE + 1).setValue(new Date());
-      break;
+      
+      matSheet.getRange(i + 1, 3).setValue(newQty); // C열 업데이트
+      matSheet.getRange(i + 1, 6).setValue(new Date()); // F열: 최종점검일 업데이트
+      return true;
     }
   }
+  return false;
 }
 
 /**
@@ -80,12 +131,12 @@ function registerScheduleFromChat(chatId, text) {
 
   try {
     const calendar = CalendarApp.getDefaultCalendar();
-    const startTime = parseInt(getOpSetting("업무시작시간")) || 8; 
+    const startTime = parseInt(getSystemSetting("업무시작시간")) || 8; 
     
-    calendar.createEvent(`[Field] ${fieldName}`, 
+    calendar.createEvent(`[ERP] ${fieldName}`, 
       new Date(targetDate.setHours(startTime, 0, 0)), 
       new Date(targetDate.setHours(startTime + 9, 0, 0)), 
-      { description: `작업: ${workDesc}\n인원: ${staffInfo}\n기록자: Smart Field AI` }
+      { description: `작업: ${workDesc}\n인원: ${staffInfo}\n기록자: 2026 Smart Field ERP` }
     );
     
     return { 
@@ -101,7 +152,7 @@ function registerScheduleFromChat(chatId, text) {
  * 📊 3. 실시간 종합 상황판 브리핑
  */
 function getTodayComprehensiveBriefing() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = SpreadsheetApp.openById(CONFIG.SS_ID);
   const logSheet = ss.getSheetByName(CONFIG.SHEETS.LOG);
   if (!logSheet) return "⚠️ 출근부 시트를 찾을 수 없습니다.";
 
@@ -114,18 +165,18 @@ function getTodayComprehensiveBriefing() {
   let totalPay = 0;
 
   for (let j = 1; j < logData.length; j++) {
-    if (!logData[j][c.L_DATE]) continue;
-    const lDate = (logData[j][c.L_DATE] instanceof Date) ? 
-                  Utilities.formatDate(logData[j][c.L_DATE], "GMT+9", "yyyy-MM-dd") : String(logData[j][c.L_DATE]);
+    if (!logData[j][0]) continue; // A열 신청일시 기준
+    const lDate = (logData[j][0] instanceof Date) ? 
+                  Utilities.formatDate(logData[j][0], "GMT+9", "yyyy-MM-dd") : String(logData[j][0]);
     
     if (lDate.includes(todayStr)) {
       totalIn++;
-      const siteName = logData[j][c.L_SITE] || "미지정";
-      const status = logData[j][c.L_STATUS] || "대기";
+      const siteName = logData[j][4] || "미지정"; // E: 현장
+      const status = logData[j][5] || "대기"; // F: 상태
       if (!siteStats[siteName]) siteStats[siteName] = { count: 0, active: 0 };
       siteStats[siteName].count++;
       if (["출근", "작업중", "퇴근완료"].includes(status)) siteStats[siteName].active++;
-      totalPay += (Number(logData[j][c.L_TOTAL]) || 0);
+      totalPay += (Number(logData[j][10]) || 0); // K: 총지급액
     }
   }
 
@@ -135,7 +186,20 @@ function getTodayComprehensiveBriefing() {
   for (let site in siteStats) {
     briefing += `📍 <b>${site}</b>\n   인원: ${siteStats[site].count}명 (활성: ${siteStats[site].active}명)\n`;
   }
-  return briefing + `━━━━━━━━━━━━━━━\n※ 강 과장님 설계 기준 기반 집계`;
+  return briefing + `━━━━━━━━━━━━━━━\n※ 강성묵 과장님 설계 기준 기반 집계`;
+}
+
+/**
+ * 📝 [자연어기록] 탭에 로그 남기기 유틸리티
+ */
+function logToNaturalLanguage(id, type, content) {
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SS_ID);
+    const logSheet = ss.getSheetByName(CONFIG.SHEETS.NLP_LOG);
+    if (logSheet) {
+      logSheet.appendRow([new Date(), id, type, content, "", "", "완료"]);
+    }
+  } catch(e) {}
 }
 
 /**
@@ -148,7 +212,6 @@ function sendScheduleSummary(chatId, year, month) {
   
   const msg = `📅 <b>작업 일정 관리 (${targetYear}년 ${targetMonth}월)</b>\n날짜를 선택하여 상세 일정을 조회하세요.`;
   
-  // 🚀 교정: 00번 모듈 엔진 규격에 맞춰 객체 상태로 전달
   return Telegram.sendMessage(chatId, msg, { reply_markup: { inline_keyboard: calendarKeyboard } });
 }
 

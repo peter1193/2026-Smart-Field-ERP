@@ -2,7 +2,7 @@
  * [모듈 05] 05_Schedule.gs
  * 프로젝트: 2026 Smart Field ERP (AI 비서 통합형)
  * 역할: 작업 일정 관리 및 시스템 자동화 스케줄러 (17:30 자동 퇴근 처리)
- * 최종 업데이트: 2026-02-16
+ * 최종 업데이트: 2026-02-24 (운영설정 연동 및 자연어기록 반영)
  */
 
 /**
@@ -10,7 +10,7 @@
  */
 function sendScheduleSummary(chatId) {
   try {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const ss = SpreadsheetApp.openById(CONFIG.SS_ID);
     const sheet = ss.getSheetByName(CONFIG.SHEETS.SCHEDULE);
     
     if (!sheet) return Telegram.sendMessage(chatId, "⚠️ '작업일정' 시트를 찾을 수 없습니다.");
@@ -36,7 +36,7 @@ function sendScheduleSummary(chatId) {
     }
 
     if (!found) {
-      summary += "➖ 오늘 예정된 현장 작업 일정이 없습니다.\n일정 등록이 필요하시면 아래 버튼을 누르세요.\n";
+      summary += "➖ 오늘 예정된 현장 작업 일정이 없습니다.\n";
     }
 
     const role = getUserRole(chatId);
@@ -92,6 +92,10 @@ function confirmScheduleInput(chatId, currentStep, text, prevData = "") {
     const parts = prevData.split("_");
     saveScheduleToSheet(parts[0], parts[1], text);
     cache.remove("USER_STATUS_" + chatId);
+    
+    // 자연어기록 연동
+    logToNaturalLanguage(chatId, "일정등록", `${parts[1]}: ${text}`);
+    
     Telegram.sendMessage(chatId, "✅ <b>작업 일정이 데이터베이스에 저장되었습니다.</b>");
     return sendScheduleSummary(chatId);
   }
@@ -101,7 +105,7 @@ function confirmScheduleInput(chatId, currentStep, text, prevData = "") {
  * 🗄️ 4. 시트 저장
  */
 function saveScheduleToSheet(date, site, memo) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = SpreadsheetApp.openById(CONFIG.SS_ID);
   const sheet = ss.getSheetByName(CONFIG.SHEETS.SCHEDULE);
   if (!sheet) return;
 
@@ -112,35 +116,38 @@ function saveScheduleToSheet(date, site, memo) {
 }
 
 /**
- * ⏰ 5. 17:30 전원 자동 퇴근 처리
+ * ⏰ 5. 17:30 전원 자동 퇴근 처리 (운영설정 연동)
  */
 function executeEveningClosing() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = SpreadsheetApp.openById(CONFIG.SS_ID);
   const attendSheet = ss.getSheetByName(CONFIG.SHEETS.LOG); 
   if (!attendSheet) return;
 
   const data = attendSheet.getDataRange().getValues();
   const todayStr = Utilities.formatDate(new Date(), "GMT+9", "yyyy-MM-dd");
   let closeCount = 0;
-  const c = CONFIG.COL;
+  
+  // 운영설정에서 마감 시간 가져오기 (기본값 17:30)
+  let closeTime = "17:30";
+  try { closeTime = getSystemSetting("퇴근마감시간") || "17:30"; } catch(e) {}
 
   for (let i = 1; i < data.length; i++) {
-    const rawDate = data[i][c.L_DATE];
+    const rawDate = data[i][0]; // A: 신청일시
     const applyDate = rawDate instanceof Date 
       ? Utilities.formatDate(rawDate, "GMT+9", "yyyy-MM-dd") 
       : "";
-    const status = data[i][c.L_STATUS];
+    const status = data[i][5]; // F: 상태
 
-    if (applyDate === todayStr && status === "출근") {
-      attendSheet.getRange(i + 1, c.L_STATUS + 1).setValue("퇴근완료"); 
-      attendSheet.getRange(i + 1, 17).setValue("17:30 시스템 자동 마감"); 
-      attendSheet.getRange(i + 1, 16).setValue("System_Auto");
+    if (applyDate === todayStr && (status === "출근" || status === "작업중")) {
+      attendSheet.getRange(i + 1, 6).setValue("퇴근완료"); 
+      attendSheet.getRange(i + 1, 17).setValue(`${closeTime} 시스템 자동 마감`); // Q: 비고
+      attendSheet.getRange(i + 1, 16).setValue("System_Auto"); // P: 승인자
       closeCount++;
     }
   }
 
   const reportMsg = `🕒 <b>[퇴근 마감 보고]</b>\n━━━━━━━━━━━━━━━\n` +
-                    `✅ 17:30 전원 퇴근 처리 완료 (${closeCount}명)\n` +
+                    `✅ ${closeTime} 기준 전원 퇴근 처리 완료 (${closeCount}명)\n` +
                     `🔓 <b>상황판은 정산 업무를 위해 가동 상태를 유지합니다.</b>`;
   
   Telegram.sendMessage(CONFIG.ADMIN_ID, reportMsg);
@@ -150,9 +157,12 @@ function executeEveningClosing() {
  * 🕒 6. 보안 LOCK 가동
  */
 function manualLockFromMonitor() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = SpreadsheetApp.openById(CONFIG.SS_ID);
   const settingSheet = ss.getSheetByName(CONFIG.SHEETS.SYSTEM);
-  if (settingSheet) settingSheet.getRange("B8").setValue("LOCK");
+  if (settingSheet) {
+    // B8 셀에 LOCK 기록 (04_SystemLogic 및 13_AuthManager 연동)
+    settingSheet.getRange("B8").setValue("LOCK");
+  }
   
   const alertMsg = "🚨 <b>[사무실 상황판 보안 잠금]</b>\n\n지시에 따라 시계 모드가 가동되었습니다.\n해제는 마스터 텔레그램에서만 가능합니다.";
   Telegram.sendMessage(CONFIG.ADMIN_ID, alertMsg);

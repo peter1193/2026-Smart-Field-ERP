@@ -2,15 +2,14 @@
  * [모듈 04] 04_SystemLogic.gs
  * 프로젝트: 2026 Smart Field ERP (AI 비서 통합형)
  * 역할: 오너 승인 액션 처리 및 출근부 실제 데이터 기록 (Action Handler)
- * 최종 업데이트: 2026-02-16
- * 수정자: Gemini (강성묵 과장 시스템 설계 최종 합의안 반영 - 데이터 무결성 강화)
+ * 최종 업데이트: 2026-02-24 (출근부 A~S열 정밀 매핑 및 위치 인증 강화)
  */
 
 /**
  * 💸 1. 오너(대표님) 및 관리자 승인 Callback 처리
  */
 function handleOwnerApproval(chatId, data) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = SpreadsheetApp.openById(CONFIG.SS_ID);
   
   // A. [지출 승인 처리]
   if (data.startsWith("exp_auth_")) {
@@ -51,9 +50,9 @@ function handleOwnerApproval(chatId, data) {
  */
 const FieldService = {
   recordLog: function(workerChatId, siteName, type, role) {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const ss = SpreadsheetApp.openById(CONFIG.SS_ID);
     const logSheet = ss.getSheetByName(CONFIG.SHEETS.LOG);
-    if (!logSheet) return;
+    if (!logSheet) return false;
 
     const worker = getWorkerInfoByChatId(workerChatId);
     const now = new Date();
@@ -65,36 +64,42 @@ const FieldService = {
     if (type === "IN") {
       let newRow = new Array(19).fill(""); 
       
-      newRow[c.L_DATE] = now;               // A: 신청일시
-      newRow[c.L_ID] = workerChatId;        // B: ID
-      newRow[c.L_NAME] = worker.name;       // C: 이름
-      newRow[c.L_NATION] = worker.lang;     // D: 국적/언어
-      newRow[c.L_SITE] = siteName;          // E: 현장
+      newRow[0] = now;                          // A: 신청일시
+      newRow[1] = workerChatId;                 // B: ID
+      newRow[2] = worker.name || "미등록";      // C: 이름
+      newRow[3] = worker.lang || "KO";          // D: 국적/언어
+      newRow[4] = siteName;                     // E: 현장
       
       // F(5) 상태: 마스터 특별 관리 적용
-      newRow[c.L_STATUS] = (role && role.isMaster) ? "마스터점검" : "출근"; 
+      newRow[5] = (role && role.isMaster) ? "마스터점검" : "출근"; 
       
-      newRow[c.L_BASIC] = worker.basicPay;   // H: 기본급
-      newRow[c.L_TOTAL] = worker.basicPay;   // K: 총지급액 초기값
+      newRow[7] = worker.basicPay || 0;         // H: 기본급
+      newRow[10] = worker.basicPay || 0;        // K: 총지급액 초기값
       
       try {
         const fieldSheet = ss.getSheetByName(CONFIG.SHEETS.FIELDS);
         const fData = fieldSheet.getDataRange().getValues();
         for(let i=1; i<fData.length; i++) {
-          if(fData[i][CONFIG.COL.F_NAME] === siteName) {
-            newRow[c.L_WEATHER] = getLiveWeather(fData[i][CONFIG.COL.F_LAT], fData[i][CONFIG.COL.F_LON]);
-            newRow[c.L_LAT] = fData[i][CONFIG.COL.F_LAT];
-            newRow[c.L_LON] = fData[i][CONFIG.COL.F_LON];
-            newRow[c.L_LOC] = `https://www.google.com/maps?q=${fData[i][CONFIG.COL.F_LAT]},${fData[i][CONFIG.COL.F_LON]}`;
+          // 현장정보 A열(현장명) 매칭
+          if(String(fData[i][0]).trim() === String(siteName).trim()) {
+            // 날씨 정보는 추후 API 연동을 위해 예약
+            newRow[11] = "🌤️ 확인중";             // L: 날씨
+            newRow[12] = fData[i][2];             // M: 위도
+            newRow[13] = fData[i][3];             // N: 경도
+            newRow[14] = `https://www.google.com/maps?q=${fData[i][2]},${fData[i][3]}`; // O: 위치
             break;
           }
         }
-      } catch(e) { newRow[c.L_WEATHER] = "🌡️ 날씨확인불가"; }
+      } catch(e) { newRow[11] = "🌡️ 날씨확인불가"; }
       
-      newRow[17] = "Telegram_GPS";          // R: 인증방식
-      newRow[c.L_CHECK] = "승인대기";        // S: 정산확인
+      newRow[17] = "TG_GPS_Auth";               // R: 인증방식
+      newRow[18] = "승인대기";                   // S: 정산확인
 
       logSheet.appendRow(newRow);
+      
+      // [자연어기록]에 흔적 남기기
+      logToNaturalLanguage(workerChatId, "출근보고", `${worker.name}: ${siteName} 입소 완료`);
+      
       return true;
     } 
     
@@ -103,13 +108,17 @@ const FieldService = {
       const data = logSheet.getDataRange().getValues();
       // 🚀 역순 탐색으로 당일 본인의 마지막 출근 기록 탐색
       for (let i = data.length - 1; i >= 1; i--) {
-        const rowDate = (data[i][c.L_DATE] instanceof Date) ? 
-                        Utilities.formatDate(data[i][c.L_DATE], "GMT+9", "yyyy-MM-dd") : "";
+        const rowDate = (data[i][0] instanceof Date) ? 
+                        Utilities.formatDate(data[i][0], "GMT+9", "yyyy-MM-dd") : "";
         
-        if (String(data[i][c.L_ID]) === String(workerChatId) && rowDate === dateStr) {
-          logSheet.getRange(i + 1, c.L_STATUS + 1).setValue("퇴근완료"); // F(5)
-          logSheet.getRange(i + 1, 17).setValue(`퇴근인증: ${timeStr}`); // Q(16)
-          logSheet.getRange(i + 1, 16).setValue("System_Auto");          // P(15)
+        if (String(data[i][1]) === String(workerChatId) && rowDate === dateStr) {
+          logSheet.getRange(i + 1, 6).setValue("퇴근완료");   // F: 상태
+          logSheet.getRange(i + 1, 17).setValue(`퇴근:${timeStr}`); // Q: 비고
+          logSheet.getRange(i + 1, 16).setValue("System_Auto");    // P: 승인자
+          
+          // [자연어기록]에 흔적 남기기
+          logToNaturalLanguage(workerChatId, "퇴근보고", `${worker.name}: 작업 종료 및 퇴소`);
+          
           return true;
         }
       }
@@ -117,3 +126,16 @@ const FieldService = {
     return false;
   }
 };
+
+/**
+ * 📝 [자연어기록] 탭에 로그 남기기 유틸리티
+ */
+function logToNaturalLanguage(id, type, content) {
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SS_ID);
+    const logSheet = ss.getSheetByName(CONFIG.SHEETS.NLP_LOG);
+    if (logSheet) {
+      logSheet.appendRow([new Date(), id, type, content, "", "", "완료"]);
+    }
+  } catch(e) { console.error("NLP 로그 기록 실패"); }
+}

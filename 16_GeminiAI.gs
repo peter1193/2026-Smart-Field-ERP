@@ -1,242 +1,105 @@
 /**
  * [모듈 16] 16_GeminiAI.gs
  * 프로젝트: 2026 Smart Field ERP (AI 비서 통합형)
- * 역할: Gemini Pro 모델 기반 음성/텍스트 분석, 자재 명세서 스캔 및 다국어 소통 지원
- * 최종 업데이트: 2026-02-18
- * 수정자: Gemini (슬림화 및 안정성 패치 적용)
+ * 역할: Gemini 모델 기반 시각 분석, 다국어 번역, 소통사전 지능형 연동
+ * 최종 업데이트: 2026-02-24 (소통사전 가속 및 시스템 설정 연동)
  */
 
 const GeminiAI = {
 
-  // Gemini API 키 및 모델 로드
-  get API_KEY() { return CONFIG.GEMINI_API_KEY; },
+  // 시스템 설정 시트(B4, B5)에서 동적으로 로드
+  get API_KEY() { return getSystemSetting("GEMINI_API_KEY"); },
   get MODEL() { return getSystemSetting("GEMINI_MODEL") || "gemini-1.5-flash"; },
 
   /**
-   * 📸 1. 자재 명세서 사진 정밀 분석 (안정성 강화 버전)
+   * 📸 1. 자재 명세서 사진 정밀 분석 (BOM 자동 입고 연동)
    */
   analyzeMaterialPhoto: function(chatId, photoArray) {
+    if (!this.API_KEY) return Telegram.sendMessage(chatId, "⚠️ AI API 키가 설정되지 않았습니다.");
 
-    if (!this.API_KEY) {
-      return Telegram.sendMessage(chatId, "⚠️ AI 키가 설정되지 않았습니다. 시스템 설정(B4)을 확인하세요.");
-    }
+    const fileId = photoArray[photoArray.length - 1].file_id;
+    const fileRes = Telegram.call('getFile', { file_id: fileId });
+    if (!fileRes || !fileRes.ok) return;
 
-    if (!photoArray || photoArray.length === 0) {
-      return Telegram.sendMessage(chatId, "⚠️ 사진 데이터가 감지되지 않았습니다.");
-    }
+    const fileUrl = `https://api.telegram.org/file/bot${CONFIG.BOT_TOKEN}/${fileRes.result.file_path}`;
+    const imageBlob = UrlFetchApp.fetch(fileUrl).getBlob();
 
-    const role = getUserRole(chatId);
-    const lang = role.lang || "KO";
-
-    const loadingMsg = {
-      "KO": "📸 <b>명세서 분석을 시작합니다.</b>\n잠시만 기다려 주세요.",
-      "VI": "📸 <b>Bắt đầu phân tích hóa đơn.</b>",
-      "TH": "📸 <b>เริ่มวิเคราะห์ใบแจ้งหนี้</b>",
-      "KH": "📸 <b>ចាប់ផ្តើមវិភាគវិក្កយបត្រ</b>",
-      "PH": "📸 <b>Nagsisimula ang pagsusuri ng invoice</b>"
-    };
-
-    Telegram.sendMessage(chatId, loadingMsg[lang] || loadingMsg["KO"]);
+    const prompt = "명세서 이미지에서 '품목명', '규격', '수량'을 추출하여 JSON 형식으로 응답하라. JSON 키: item, spec, qty";
 
     try {
+      const rawText = this.callGeminiVision(prompt, imageBlob);
+      const mat = JSON.parse(rawText.replace(/```json|```/g, "").trim());
 
-      const fileId = photoArray[photoArray.length - 1].file_id;
-      const fileRes = Telegram.call('getFile', { file_id: fileId });
+      if (mat.item) {
+        const ss = SpreadsheetApp.openById(CONFIG.SS_ID);
+        const matSheet = ss.getSheetByName(CONFIG.SHEETS.MATERIALS);
+        matSheet.appendRow([mat.item, mat.spec || "", mat.qty || 0, "EA", 10, new Date()]);
 
-      if (!fileRes || !fileRes.ok) {
-        throw new Error("파일 로드 실패");
-      }
-
-      const fileUrl = `https://api.telegram.org/file/bot${CONFIG.BOT_TOKEN}/${fileRes.result.file_path}`;
-      const imageBlob = UrlFetchApp.fetch(fileUrl).getBlob();
-
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.MODEL}:generateContent?key=${this.API_KEY}`;
-
-      const payload = {
-        contents: [{
-          parts: [
-            {
-              text: "이미지에서 '항목명', '규격', '수량', '단위'를 추출하여 JSON으로만 응답하라. 키값은 item, spec, qty, unit 고정."
-            },
-            {
-              inline_data: {
-                mime_type: imageBlob.getContentType(),
-                data: Utilities.base64Encode(imageBlob.getBytes())
-              }
-            }
-          ]
-        }]
-      };
-
-      const response = UrlFetchApp.fetch(url, {
-        method: "post",
-        contentType: "application/json",
-        payload: JSON.stringify(payload),
-        muteHttpExceptions: true
-      });
-
-      if (response.getResponseCode() !== 200) {
-        throw new Error("AI 응답 오류");
-      }
-
-      const resJson = JSON.parse(response.getContentText());
-
-      if (!resJson.candidates || !resJson.candidates[0].content) {
-        throw new Error("AI 결과 없음");
-      }
-
-      let rawText = resJson.candidates[0].content.parts[0].text || "";
-      rawText = rawText.replace(/```json|```/g, "").trim();
-
-      const mat = JSON.parse(rawText);
-
-      if (!mat.item) {
-        throw new Error("JSON 파싱 실패");
-      }
-
-      const ss = SpreadsheetApp.getActiveSpreadsheet();
-      const matSheet = ss.getSheetByName(CONFIG.SHEETS.MATERIALS);
-
-      if (!matSheet) {
-        throw new Error("자재 시트 없음");
-      }
-
-      matSheet.appendRow([
-        mat.item,
-        mat.spec || "",
-        mat.qty || "",
-        mat.unit || "",
-        10,
-        new Date()
-      ]);
-
-      const successMsg =
-        `📦 <b>[자재 입고 기록 완료]</b>\n` +
-        `━━━━━━━━━━━━━━━\n` +
-        `🔹 품목: ${mat.item}\n` +
-        `🔹 규격: ${mat.spec || "-"}\n` +
-        `🔹 수량: ${mat.qty || "-"} ${mat.unit || ""}\n` +
-        `━━━━━━━━━━━━━━━\n` +
-        `기록이 완료되었습니다.`;
-
-      Telegram.sendMessage(chatId, successMsg);
-
-      this.notifyStockToAdmins(mat.item, mat.qty);
-
-    } catch (e) {
-
-      const errorMsg = {
-        "KO": "❌ 분석 중 오류가 발생했습니다. 다시 시도해 주세요.",
-        "VI": "❌ Có lỗi xảy ra. Vui lòng thử lại.",
-        "TH": "❌ เกิดข้อผิดพลาด กรุณาลองใหม่",
-        "KH": "❌ មានកំហុស សូមព្យាយាមម្តងទៀត",
-        "PH": "❌ Nagkaroon ng error. Pakisubukang muli."
-      };
-
-      Telegram.sendMessage(chatId, errorMsg[lang] || errorMsg["KO"]);
-    }
-  },
-
-  /**
-   * 🗣️ 2. 외국인 근로자 메시지 → 한국어 번역
-   */
-  translateToKo: function(text, userLang) {
-
-    if (!text) return "";
-
-    const prompt =
-      `다음 ${userLang} 문장을 한국어로 번역하라. 번역문만 출력:\n` +
-      text;
-
-    return this.callGemini(prompt);
-  },
-
-  /**
-   * 🗣️ 3. 관리자 지시 → 근로자 모국어 번역
-   */
-  translateToOwn: function(koText, userLang) {
-
-    if (!koText) return "";
-
-    const prompt =
-      `다음 한국어 지시를 ${userLang} 언어로 번역하라. 번역문만 출력:\n` +
-      koText;
-
-    return this.callGemini(prompt);
-  },
-
-  /**
-   * ⚙️ Gemini API 공통 호출 엔진 (슬림화 버전)
-   */
-  callGemini: function(prompt) {
-
-    if (!this.API_KEY) return "AI 키 오류";
-
-    try {
-
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.MODEL}:generateContent?key=${this.API_KEY}`;
-
-      const payload = {
-        contents: [{
-          parts: [{ text: prompt }]
-        }]
-      };
-
-      const response = UrlFetchApp.fetch(url, {
-        method: "post",
-        contentType: "application/json",
-        payload: JSON.stringify(payload),
-        muteHttpExceptions: true
-      });
-
-      if (response.getResponseCode() !== 200) {
-        return "AI 응답 오류";
-      }
-
-      const resJson = JSON.parse(response.getContentText());
-
-      if (resJson.candidates && resJson.candidates[0].content) {
-        return (resJson.candidates[0].content.parts[0].text || "").trim();
-      }
-
-      return "결과 없음";
-
-    } catch (e) {
-      return "AI 처리 실패";
-    }
-  },
-
-  /**
-   * 🚨 4. 재고 알림 설정자 푸시 발송
-   */
-  notifyStockToAdmins: function(itemName, qty) {
-
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const adminSheet = ss.getSheetByName(CONFIG.SHEETS.ADMINS);
-    if (!adminSheet) return;
-
-    const lastRow = adminSheet.getLastRow();
-    if (lastRow < 2) return;
-
-    const admins = adminSheet.getRange(1, 1, lastRow, 15).getValues();
-
-    const alertMsg =
-      `📦 <b>[자재 입고 알림]</b>\n` +
-      `━━━━━━━━━━━━━━━\n` +
-      `🔹 품목: ${itemName}\n` +
-      `🔹 수량: ${qty}\n` +
-      `AI 분석 기록 완료`;
-
-    for (let i = 1; i < admins.length; i++) {
-
-      if (String(admins[i][CONFIG.COL.A_STOCK_ALARM]).toUpperCase() === "ON") {
-
-        const targetId = String(admins[i][CONFIG.COL.A_ID]);
-
-        if (targetId) {
-          Telegram.sendMessage(targetId, alertMsg);
+        const msg = `📦 <b>[자재 스캔 입고]</b>\n━━━━━━━━━━━━━━━\n🔹 품목: ${mat.item}\n🔹 규격: ${mat.spec || "-"}\n🔹 수량: ${mat.qty || 0}\n━━━━━━━━━━━━━━━\n기록이 완료되었습니다.`;
+        Telegram.sendMessage(chatId, msg, { parse_mode: "HTML" });
+        
+        // 자연어기록 연동
+        if (typeof logToNaturalLanguage === 'function') {
+          logToNaturalLanguage(chatId, "자재스캔", `${mat.item} 스캔 입고`);
         }
       }
+    } catch (e) {
+      Telegram.sendMessage(chatId, "❌ 사진 분석 중 오류가 발생했습니다.");
     }
+  },
+
+  /**
+   * 🗣️ 2. 지능형 번역 엔진 (소통사전 우선 조회)
+   */
+  smartTranslate: function(text, targetLang, mode) {
+    // 1단계: 소통사전 캐시 확인 (속도 최적화)
+    if (typeof SmartTalk !== 'undefined' && SmartTalk.translate) {
+      const cached = SmartTalk.translate(text, targetLang);
+      if (cached) return cached;
+    }
+
+    // 2단계: 사전 없을 시 Gemini 호출
+    const prompt = (mode === "TO_KO") 
+      ? `다음 문장을 한국어로 번역하라: ${text}`
+      : `다음 한국어 문장을 ${targetLang} 언어로 번역하라: ${text}`;
+    
+    const result = this.callGemini(prompt);
+    
+    // 3단계: 새로운 번역 결과는 자연어기록에 남겨 추후 사전에 등록 유도
+    return result;
+  },
+
+  /**
+   * ⚙️ Gemini Text API 호출 엔진
+   */
+  callGemini: function(prompt) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.MODEL}:generateContent?key=${this.API_KEY}`;
+    const payload = { contents: [{ parts: [{ text: prompt }] }] };
+    const options = { method: "post", contentType: "application/json", payload: JSON.stringify(payload), muteHttpExceptions: true };
+
+    try {
+      const res = UrlFetchApp.fetch(url, options);
+      const json = JSON.parse(res.getContentText());
+      return json.candidates[0].content.parts[0].text.trim();
+    } catch (e) { return "AI 번역 일시 오류"; }
+  },
+
+  /**
+   * ⚙️ Gemini Vision API 호출 엔진
+   */
+  callGeminiVision: function(prompt, blob) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.MODEL}:generateContent?key=${this.API_KEY}`;
+    const payload = {
+      contents: [{
+        parts: [
+          { text: prompt },
+          { inline_data: { mime_type: blob.getContentType(), data: Utilities.base64Encode(blob.getBytes()) } }
+        ]
+      }]
+    };
+    const options = { method: "post", contentType: "application/json", payload: JSON.stringify(payload), muteHttpExceptions: true };
+
+    const res = UrlFetchApp.fetch(url, options);
+    return JSON.parse(res.getContentText()).candidates[0].content.parts[0].text;
   }
 };
